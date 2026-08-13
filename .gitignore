@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+dist/
+release/
+*.tsbuildinfo
+.vite/
+.idea/
+.vscode/
+android/.gradle/
+android/app/build/
+android/local.properties
+.DS_Store

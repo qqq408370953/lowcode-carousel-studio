@@ -1,0 +1,62 @@
+name: Build local apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            command: pack:mac
+            artifact: carousel-studio-macos
+          - os: windows-latest
+            command: pack:win
+            artifact: carousel-studio-windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run ${{ matrix.command }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - run: npm ci
+      - run: npm run check
+      - run: npm run android:sync
+      - run: chmod +x gradlew
+        working-directory: android
+      - run: ./gradlew assembleDebug
+        working-directory: android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carousel-studio-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
