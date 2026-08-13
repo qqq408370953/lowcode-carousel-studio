@@ -27,8 +27,12 @@ function loadLocalEnv() {
 }
 
 loadLocalEnv();
-const port = Number(process.env.PORT || 4177);
+const requestedPort = Number(process.env.PORT || 4177);
 const host = process.env.HOST || '0.0.0.0';
+const startPort = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535
+  ? requestedPort
+  : 4177;
+const maxPort = Math.min(startPort + 100, 65535);
 
 const mimeTypes = {
   '.html': 'text/html; charset=utf-8',
@@ -408,9 +412,35 @@ const server = createServer(async (req, res) => {
   createReadStream(filePath).pipe(res);
 });
 
-server.listen(port, host, () => {
-  console.log(`Lowcode Carousel Studio running at http://localhost:${port}`);
-  if (host === '0.0.0.0') {
-    console.log(`LAN access: http://<this-computer-LAN-IP>:${port}`);
-  }
-});
+function listen(port) {
+  const handleListening = () => {
+    server.off('error', handleError);
+    console.log(`Lowcode Carousel Studio running at http://localhost:${port}`);
+    if (host === '0.0.0.0') {
+      console.log(`LAN access: http://<this-computer-LAN-IP>:${port}`);
+    }
+  };
+
+  const handleError = (error) => {
+    server.off('listening', handleListening);
+    if (error.code === 'EADDRINUSE' && port < maxPort) {
+      const nextPort = port + 1;
+      console.warn(`Port ${port} is in use, trying ${nextPort}...`);
+      listen(nextPort);
+      return;
+    }
+
+    if (error.code === 'EADDRINUSE') {
+      console.error(`No available port found in range ${startPort}-${maxPort}.`);
+    } else {
+      console.error('Failed to start Lowcode Carousel Studio:', error);
+    }
+    process.exitCode = 1;
+  };
+
+  server.once('error', handleError);
+  server.once('listening', handleListening);
+  server.listen(port, host);
+}
+
+listen(startPort);
