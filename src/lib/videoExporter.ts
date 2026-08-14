@@ -21,16 +21,17 @@ interface FrameState {
   rotate: number;
 }
 
-function getMimeType(hasAudio: boolean) {
+function getMimeType(hasAudio: boolean, preferWebM: boolean) {
   const h264Candidates = hasAudio
     ? ['video/mp4;codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4;codecs="avc1.42E01E"']
     : ['video/mp4;codecs="avc1.42E01E"', 'video/mp4;codecs="avc1"'];
-  const candidates = [
-    ...h264Candidates,
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm'
-  ];
+  const webmCandidates = hasAudio
+    ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus']
+    : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8'];
+  webmCandidates.push('video/webm');
+  const candidates = preferWebM
+    ? [...webmCandidates, ...h264Candidates]
+    : [...h264Candidates, ...webmCandidates];
   return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
 }
 
@@ -43,24 +44,68 @@ async function inspectCodec(blob: Blob) {
   return 'unknown';
 }
 
+function validateExpectedDuration(actualDuration: number, expectedDuration: number) {
+  if (!Number.isFinite(actualDuration) || actualDuration <= 0.1) {
+    throw new Error('导出视频的时长元数据无效，请重试');
+  }
+  if (expectedDuration >= 1 && actualDuration < expectedDuration * 0.8) {
+    throw new Error(`导出视频不完整：预期 ${expectedDuration.toFixed(1)}s，实际 ${actualDuration.toFixed(1)}s`);
+  }
+}
+
+function readBlobVideoDuration(blob: Blob) {
+  return new Promise<number>((resolve, reject) => {
+    const video = document.createElement('video');
+    const url = URL.createObjectURL(blob);
+    let settled = false;
+    let timeout = 0;
+    const finish = (duration: number, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      video.removeAttribute('src');
+      video.load();
+      URL.revokeObjectURL(url);
+      if (error) reject(error);
+      else resolve(duration);
+    };
+    timeout = window.setTimeout(() => finish(0, new Error('读取导出视频时长超时')), 8000);
+    video.preload = 'metadata';
+    video.muted = true;
+    video.onloadedmetadata = () => finish(video.duration);
+    video.onerror = () => finish(0, new Error('无法读取导出视频的元数据'));
+    video.src = url;
+  });
+}
+
 async function makeCompatibleVideo(
   blob: Blob,
+  expectedDuration: number,
   signal: AbortSignal,
   onProgress: (progress: ExportProgress) => void
 ) {
+  if (blob.size < 1024) throw new Error('录制器未生成有效视频数据，请重试');
   const codec = await inspectCodec(blob);
-  if (blob.type.includes('mp4') && codec === 'h264') return {blob, extension: 'mp4'};
 
   if (Capacitor.isNativePlatform()) {
+    if (blob.type.includes('mp4') && codec === 'h264') {
+      validateExpectedDuration(await readBlobVideoDuration(blob), expectedDuration);
+      return {blob, extension: 'mp4'};
+    }
     if (blob.type.includes('webm')) return {blob, extension: 'webm'};
     throw new Error(`当前设备生成了 ${codec.toUpperCase()} 编码，无法封装为兼容 MP4`);
   }
 
   if (location.protocol === 'http:' || location.protocol === 'https:') {
-    onProgress({progress: 99, message: '正在转换为兼容的 H.264 MP4'});
+    onProgress({progress: 99, message: '正在校验时长并封装 H.264 MP4'});
     const response = await fetch('/api/transcode-video', {
       method: 'POST',
-      headers: {'Content-Type': blob.type || 'application/octet-stream'},
+      headers: {
+        'Content-Type': blob.type || 'application/octet-stream',
+        'X-Expected-Duration': String(expectedDuration)
+      },
       body: blob,
       signal
     });
@@ -68,9 +113,19 @@ async function makeCompatibleVideo(
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.error || `视频兼容转换失败 (${response.status})`);
     }
-    return {blob: await response.blob(), extension: 'mp4'};
+    const output = await response.blob();
+    const outputDuration = Number(response.headers.get('X-Video-Duration') || 0);
+    if (output.size < 1024) {
+      throw new Error('视频封装完成但时长无效，请重试');
+    }
+    validateExpectedDuration(outputDuration, expectedDuration);
+    return {blob: output, extension: 'mp4'};
   }
 
+  if (blob.type.includes('mp4') && codec === 'h264') {
+    validateExpectedDuration(await readBlobVideoDuration(blob), expectedDuration);
+    return {blob, extension: 'mp4'};
+  }
   if (blob.type.includes('webm')) return {blob, extension: 'webm'};
   throw new Error(`当前运行环境生成了 ${codec.toUpperCase()} 编码，无法直接导出兼容 MP4`);
 }
@@ -623,12 +678,14 @@ export async function exportStudioVideo(
 ) {
   if (!state.slides.some((slide) => slide.images.length || slide.videos.length || slide.player?.posterSrc || slide.websiteCover)) throw new Error('请至少放入一张图片、视频或封面模板再导出');
   const hasVideoAudio = state.slides.some((slide) => slide.videos.some((video) => !video.muted && video.volume > 0));
-  const mimeType = getMimeType(Boolean(state.narration.audioUrl || hasVideoAudio));
+  const canUseServerTranscoder = !Capacitor.isNativePlatform() && (location.protocol === 'http:' || location.protocol === 'https:');
+  const mimeType = getMimeType(Boolean(state.narration.audioUrl || hasVideoAudio), canUseServerTranscoder);
   if (!mimeType) throw new Error('当前浏览器不支持 MediaRecorder 视频导出');
 
   const {width, height} = aspectDimensions(state.aspect);
   const timelineDuration = state.slides.reduce((sum, slide) => sum + slide.duration, 0);
   const duration = Math.max(timelineDuration, state.narration.duration || 0);
+  if (!Number.isFinite(duration) || duration < 0.5) throw new Error('视频时长无效，请检查屏幕时长设置');
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -690,12 +747,25 @@ export async function exportStudioVideo(
   recorder.ondataavailable = (event) => {
     if (event.data.size) chunks.push(event.data);
   };
-  const finished = new Promise<void>((resolve) => {
+  const finished = new Promise<void>((resolve, reject) => {
     recorder.onstop = () => resolve();
+    recorder.onerror = () => reject(new Error('浏览器视频录制器发生错误'));
   });
-  const startedAt = performance.now();
+  let startedAt = 0;
   let frameTimer = 0;
   let activeSlideId = '';
+  let stopRequested = false;
+
+  const stopRecorder = () => {
+    if (stopRequested || recorder.state !== 'recording') return;
+    stopRequested = true;
+    try {
+      recorder.requestData();
+    } catch {
+      // stop() still flushes the recorder on browsers without requestData support.
+    }
+    recorder.stop();
+  };
 
   const syncVideoPlayback = (slide: Slide, localTime: number) => {
     if (slide.id !== activeSlideId) {
@@ -722,7 +792,7 @@ export async function exportStudioVideo(
   const drawFrame = () => {
     const elapsed = (performance.now() - startedAt) / 1000;
     if (signal.aborted || elapsed >= duration) {
-      recorder.stop();
+      stopRecorder();
       return;
     }
     const time = Math.min(elapsed, duration);
@@ -799,21 +869,36 @@ export async function exportStudioVideo(
     frameTimer = window.setTimeout(drawFrame, 1000 / 30);
   };
 
-  recorder.start(250);
-  if (audioContext) await audioContext.resume();
-  if (audioElement) await audioElement.play();
-  drawFrame();
-  await finished;
-  window.clearTimeout(frameTimer);
-  audioElement?.pause();
-  videoCache.forEach((video) => video.pause());
-  if (audioContext) await audioContext.close();
-  stream.getTracks().forEach((track) => track.stop());
-  if (signal.aborted) throw new DOMException('导出已取消', 'AbortError');
+  const abortRecording = () => stopRecorder();
+  signal.addEventListener('abort', abortRecording, {once: true});
 
-  const result = await makeCompatibleVideo(new Blob(chunks, {type: recordedMimeType}), signal, onProgress);
-  onProgress({progress: 100, message: '完成 H.264 视频封装'});
-  return result;
+  try {
+    context.fillStyle = '#050608';
+    context.fillRect(0, 0, width, height);
+    if (audioContext) await audioContext.resume();
+    recorder.start(250);
+    if (audioElement) {
+      audioElement.currentTime = 0;
+      await audioElement.play();
+    }
+    startedAt = performance.now();
+    drawFrame();
+    await finished;
+    if (signal.aborted) throw new DOMException('导出已取消', 'AbortError');
+
+    const recordedBlob = new Blob(chunks, {type: recordedMimeType});
+    const result = await makeCompatibleVideo(recordedBlob, duration, signal, onProgress);
+    onProgress({progress: 100, message: '完成 H.264 视频封装'});
+    return result;
+  } finally {
+    signal.removeEventListener('abort', abortRecording);
+    window.clearTimeout(frameTimer);
+    if (recorder.state === 'recording') recorder.stop();
+    audioElement?.pause();
+    videoCache.forEach((video) => video.pause());
+    if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+    stream.getTracks().forEach((track) => track.stop());
+  }
 }
 
 function canvasToPng(canvas: HTMLCanvasElement) {

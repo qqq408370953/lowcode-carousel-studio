@@ -331,8 +331,37 @@ function runFfmpeg(args) {
   });
 }
 
+function probeVideoDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.env.FFPROBE_PATH || 'ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filePath
+    ], {stdio: ['ignore', 'pipe', 'pipe']});
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout = `${stdout}${chunk}`.slice(-1000);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr = `${stderr}${chunk}`.slice(-2000);
+    });
+    child.on('error', (error) => reject(new Error(`无法启动 FFprobe：${error.message}`)));
+    child.on('close', (code) => {
+      const duration = Number(stdout.trim());
+      if (code === 0 && Number.isFinite(duration)) resolve(duration);
+      else reject(new Error(`FFprobe 时长检测失败：${stderr.slice(-800)}`));
+    });
+  });
+}
+
 async function handleVideoTranscode(req, res) {
   const contentLength = Number(req.headers['content-length'] || 0);
+  const requestedDuration = Number(req.headers['x-expected-duration'] || 0);
+  const expectedDuration = Number.isFinite(requestedDuration) && requestedDuration > 0
+    ? Math.min(requestedDuration, 60 * 60 * 6)
+    : 0;
   if (contentLength > 1024 * 1024 * 800) {
     sendJson(res, 413, {error: '待转换视频超过 800MB'});
     return;
@@ -343,8 +372,11 @@ async function handleVideoTranscode(req, res) {
   const outputPath = join(workDir, 'output.mp4');
   try {
     await pipeline(req, createWriteStream(inputPath));
+    const inputStat = await stat(inputPath);
+    if (inputStat.size < 1024) throw new Error('录制视频数据为空');
     await runFfmpeg([
       '-y',
+      '-fflags', '+genpts',
       '-i', inputPath,
       '-map', '0:v:0',
       '-map', '0:a?',
@@ -354,15 +386,24 @@ async function handleVideoTranscode(req, res) {
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-b:a', '192k',
+      '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
       outputPath
     ]);
     const outputStat = await stat(outputPath);
+    const outputDuration = await probeVideoDuration(outputPath);
+    if (outputStat.size < 1024 || outputDuration <= 0.1) {
+      throw new Error('转码后的 MP4 时长无效');
+    }
+    if (expectedDuration >= 1 && outputDuration < expectedDuration * 0.8) {
+      throw new Error(`转码后视频不完整：预期 ${expectedDuration.toFixed(1)}s，实际 ${outputDuration.toFixed(1)}s`);
+    }
     res.writeHead(200, {
       'Content-Type': 'video/mp4',
       'Content-Length': outputStat.size,
       'Cache-Control': 'no-store',
-      'X-Video-Codec': 'h264'
+      'X-Video-Codec': 'h264',
+      'X-Video-Duration': outputDuration.toFixed(3)
     });
     await pipeline(createReadStream(outputPath), res);
   } catch (error) {
